@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -181,100 +182,173 @@ def save_snapshot(pos, mass, filename, title, L_lim=None, dpi=150):
     ax.tick_params(colors='white')
     for spine in ax.spines.values():
         spine.set_color('white')
+    os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
     fig.savefig(filename, dpi=dpi, bbox_inches='tight',
                 facecolor=fig.get_facecolor())
     plt.close(fig)
     print(f"Сохранён снимок: {filename}")
 
 
-def run_simulation(N=500, D=2, n_steps=800, dt=0.005,
-                   G=1.0, eps=0.05, theta=0.5,
-                   use_tree=False, integrator="verlet",
-                   seed=42, L=None,
-                   save_initial=None, save_final=None):
-    print(f"Запуск: N={N}, D={D}, steps={n_steps}, dt={dt}, "
-          f"tree={use_tree}, integrator={integrator}")
-    pos, vel, mass = init_disk(N, D, seed, G)
+def run_dual_simulation(N=300, D=2, n_steps=600, dt=0.005,
+                        G=1.0, eps=0.05, theta=0.5,
+                        seed=42, L=None,
+                        save_initial=None, save_final=None):
+    """
+    Запускает две симуляции параллельно:
+      - PP  (прямое суммирование) — эталон
+      - BH  (Barnes-Hut)           — приближение
+    Возвращает траектории и энергии обеих систем.
+    """
+    print(f"Двойная симуляция: N={N}, D={D}, steps={n_steps}, dt={dt}, "
+          f"theta={theta}")
+
+    pos_pp, vel_pp, mass = init_disk(N, D, seed, G)
+    pos_bh = pos_pp.copy()
+    vel_bh = vel_pp.copy()
 
     if save_initial is not None and D == 2:
-        save_snapshot(pos, mass, save_initial,
-                      title=f"Шаг 0 / {n_steps}")
+        save_snapshot(pos_pp, mass, save_initial,
+                      "Шаг 0 (начальное состояние)")
 
-    trajectory = np.empty((n_steps + 1, N, D))
-    trajectory[0] = pos
-    E0, _, _ = total_energy(pos, vel, mass, G, eps, L)
-    energies = np.empty(n_steps + 1)
-    energies[0] = E0
+    traj_pp = np.empty((n_steps + 1, N, D))
+    traj_bh = np.empty((n_steps + 1, N, D))
+    traj_pp[0] = pos_pp
+    traj_bh[0] = pos_bh
 
-    if integrator == "verlet":
-        if use_tree:
-            acc0 = accelerations_bh(pos, mass, G, theta, eps)
-        else:
-            acc0 = accelerations_direct(pos, mass, G, eps, L)
-        pos_prev = pos - dt * vel + 0.5 * dt ** 2 * acc0
-        if L is not None:
-            pos_prev = wrap(pos_prev, L)
+    E_pp = np.empty(n_steps + 1)
+    E_bh = np.empty(n_steps + 1)
+    E_pp[0], _, _ = total_energy(pos_pp, vel_pp, mass, G, eps, L)
+    E_bh[0], _, _ = total_energy(pos_bh, vel_bh, mass, G, eps, L)
+
+    acc_pp_0 = accelerations_direct(pos_pp, mass, G, eps, L)
+    acc_bh_0 = accelerations_bh(pos_bh, mass, G, theta, eps)
+
+    pos_prev_pp = pos_pp - dt * vel_pp + 0.5 * dt ** 2 * acc_pp_0
+    pos_prev_bh = pos_bh - dt * vel_bh + 0.5 * dt ** 2 * acc_bh_0
+    if L is not None:
+        pos_prev_pp = wrap(pos_prev_pp, L)
+        pos_prev_bh = wrap(pos_prev_bh, L)
 
     for step in range(n_steps):
-        if integrator == "verlet":
-            pos_new = verlet_step(pos, pos_prev, mass, dt,
-                                  G, eps, use_tree, theta, L)
-            vel = (pos_new - pos_prev) / (2 * dt)
-            pos_prev, pos = pos, pos_new
-        else:
-            pos, vel = leapfrog_step(pos, vel, mass, dt,
-                                     G, eps, use_tree, theta, L)
-        trajectory[step + 1] = pos
-        E, _, _ = total_energy(pos, vel, mass, G, eps, L)
-        energies[step + 1] = E
+        pos_new_pp = verlet_step(pos_pp, pos_prev_pp, mass, dt,
+                                  G, eps, use_tree=False, theta=theta, L=L)
+        vel_pp = (pos_new_pp - pos_prev_pp) / (2 * dt)
+        pos_prev_pp, pos_pp = pos_pp, pos_new_pp
+        traj_pp[step + 1] = pos_pp
+        E_pp[step + 1], _, _ = total_energy(pos_pp, vel_pp, mass, G, eps, L)
+
+        pos_new_bh = verlet_step(pos_bh, pos_prev_bh, mass, dt,
+                                  G, eps, use_tree=True, theta=theta, L=L)
+        vel_bh = (pos_new_bh - pos_prev_bh) / (2 * dt)
+        pos_prev_bh, pos_bh = pos_bh, pos_new_bh
+        traj_bh[step + 1] = pos_bh
+        E_bh[step + 1], _, _ = total_energy(pos_bh, vel_bh, mass, G, eps, L)
 
     if save_final is not None and D == 2:
-        save_snapshot(pos, mass, save_final,
-                      title=f"Шаг {n_steps} / {n_steps}")
+        base = save_final.rsplit(".", 1)[0]
+        save_snapshot(pos_pp, mass, f"{base}_pp.png",
+                      f"Шаг {n_steps} (эталон PP)")
+        save_snapshot(pos_bh, mass, f"{base}_bh.png",
+                      f"Шаг {n_steps} (приближение BH)")
 
-    print(f"E0 = {energies[0]:.6f}, E_end = {energies[-1]:.6f}, "
-          f"ΔE/E0 = {abs((energies[-1]-energies[0])/energies[0])*100:.4f}%")
-    return trajectory, energies
+    return traj_pp, traj_bh, E_pp, E_bh
 
 
-def animate(trajectory, interval=30, L_lim=None):
-    n_frames, N, D = trajectory.shape
+def animate_dual(traj_pp, traj_bh, interval=30, L_lim=None,
+                 save_gif=None, gif_fps=30):
+    """
+    Анимация: белые точки — эталон (PP), красные — приближение (BH).
+    """
+    n_frames, N, D = traj_pp.shape
     if D != 2:
         raise ValueError("Анимация работает только для D=2")
+
     if L_lim is None:
-        L_lim = 1.2 * np.max(np.abs(trajectory))
-    fig, ax = plt.subplots(figsize=(6, 6))
+        all_pos = np.concatenate([traj_pp, traj_bh], axis=0)
+        L_lim = 1.2 * np.max(np.abs(all_pos))
+
+    fig, ax = plt.subplots(figsize=(7, 7))
     ax.set_aspect('equal')
     ax.set_xlim(-L_lim, L_lim)
     ax.set_ylim(-L_lim, L_lim)
     ax.set_facecolor('black')
-    scat = ax.scatter(trajectory[0, :, 0], trajectory[0, :, 1],
-                      s=5, c='white', alpha=0.9)
+
+    scat_pp = ax.scatter(traj_pp[0, :, 0], traj_pp[0, :, 1],
+                          s=10, c='white', alpha=0.7,
+                          edgecolors='none', label='PP (эталон)')
+    scat_bh = ax.scatter(traj_bh[0, :, 0], traj_bh[0, :, 1],
+                          s=10, c='red', alpha=0.7,
+                          edgecolors='none', label='BH (приближение)')
+
+    ax.legend(loc='upper right', facecolor='black',
+              edgecolor='white', labelcolor='white', framealpha=0.8)
 
     def update(frame):
-        scat.set_offsets(trajectory[frame])
-        ax.set_title(f"Шаг {frame}/{n_frames-1}", color='white')
+        scat_pp.set_offsets(traj_pp[frame])
+        scat_bh.set_offsets(traj_bh[frame])
+        ax.set_title(f"Шаг {frame}/{n_frames - 1}", color='white')
         ax.tick_params(colors='white')
-        return scat,
+        for spine in ax.spines.values():
+            spine.set_color('white')
+        return scat_pp, scat_bh
 
     ani = FuncAnimation(fig, update, frames=n_frames,
                         interval=interval, blit=True)
+
+    if save_gif is not None:
+        os.makedirs(os.path.dirname(save_gif) or ".", exist_ok=True)
+        ani.save(save_gif, writer='pillow', fps=gif_fps)
+        print(f"Сохранена анимация: {save_gif}")
+
     plt.show()
     return ani
 
 
-def plot_energy(energies):
+def plot_divergence(traj_pp, traj_bh, save_path=None):
+    """График |r_PP - r_BH| по времени: среднее и максимум."""
+    diff = np.linalg.norm(traj_pp - traj_bh, axis=-1)  # (n_frames, N)
+    mean_div = diff.mean(axis=1)
+    max_div = diff.max(axis=1)
+
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(energies / energies[0], color='steelblue')
+    ax.plot(mean_div, label='Среднее отклонение', color='steelblue')
+    ax.plot(max_div, label='Максимальное отклонение', color='crimson')
     ax.set_xlabel('Шаг')
-    ax.set_ylabel('E(t) / E(0)')
-    ax.set_title('Сохранение полной энергии')
+    ax.set_ylabel('|Δr|')
+    ax.set_title('Расхождение PP и Barnes–Hut во времени')
     ax.grid(alpha=0.3)
+    ax.legend()
     plt.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Сохранён график расхождения: {save_path}")
+
     plt.show()
 
 
-def compare_pp_bh(N=500, D=3, theta=0.5, eps=0.05, seed=1):
+def plot_energy_dual(E_pp, E_bh, save_path=None):
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(E_pp / E_pp[0], label='PP (эталон)', color='steelblue')
+    ax.plot(E_bh / E_bh[0], label='BH (приближение)', color='crimson',
+            linestyle='--')
+    ax.set_xlabel('Шаг')
+    ax.set_ylabel('E(t) / E(0)')
+    ax.set_title('Сохранение энергии: PP и Barnes–Hut')
+    ax.grid(alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Сохранён график энергии: {save_path}")
+
+    plt.show()
+
+
+def compare_pp_bh(N=300, D=3, theta=0.5, eps=0.05, seed=1):
     rng = np.random.default_rng(seed)
     pos = rng.normal(0, 1, size=(N, D))
     mass = rng.uniform(0.5, 1.5, size=N)
@@ -290,22 +364,26 @@ def compare_pp_bh(N=500, D=3, theta=0.5, eps=0.05, seed=1):
 
 
 if __name__ == "__main__":
-    compare_pp_bh(N=500, D=3, theta=0.5)
+    os.makedirs("docs", exist_ok=True)
 
-    N        = 500
-    D        = 2
-    steps    = 600
-    dt       = 0.005
-    use_tree = False
+    compare_pp_bh(N=300, D=3, theta=0.5)
 
-    traj, E = run_simulation(
+    N     = 300
+    D     = 2
+    steps = 600
+    dt    = 0.005
+
+    traj_pp, traj_bh, E_pp, E_bh = run_dual_simulation(
         N=N, D=D, n_steps=steps, dt=dt,
         G=1.0, eps=0.05, theta=0.5,
-        use_tree=use_tree, integrator="verlet",
         seed=42, L=None,
-        save_initial="nbody_initial.png",
-        save_final="nbody_final.png"
+        save_initial="docs/nbody_initial.png",
+        save_final="docs/nbody_final.png"
     )
 
-    plot_energy(E)
-    animate(traj, interval=30)
+    plot_energy_dual(E_pp, E_bh,
+                     save_path="docs/nbody_energy.png")
+    plot_divergence(traj_pp, traj_bh,
+                    save_path="docs/nbody_divergence.png")
+    animate_dual(traj_pp, traj_bh, interval=30,
+                 save_gif="docs/nbody_animation.gif")
